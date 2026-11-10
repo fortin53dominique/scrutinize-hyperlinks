@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+from urllib.parse import urlparse, parse_qs, unquote
 import streamlit as st
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -272,37 +273,91 @@ def extract_links(services, file_id, mime_type):
         raise ValueError(f"Type de fichier non pris en charge : {mime_type}")
 
 def extract_drive_file_id(url):
-    patterns = [
-        r'drive\.google\.com/(?:file/d/|folders/)([a-zA-Z0-9_-]+)',
-        r'docs\.google\.com/(?:document|spreadsheets|presentation)/d/([a-zA-Z0-9_-]+)'
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
+    """Extrait l'ID d'un lien Drive/Docs sous toutes ses formes courantes
+    (/u/0/, /drive/folders/, open?id=, uc?id=, liens enveloppés google.com/url?q=...)."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    host = parsed.netloc.lower()
+
+    # Lien redirigé : https://www.google.com/url?q=<vraie_url>
+    if host.endswith("google.com") and parsed.path == "/url":
+        target = parse_qs(parsed.query).get("q") or parse_qs(parsed.query).get("url")
+        return extract_drive_file_id(unquote(target[0])) if target else None
+
+    if host not in ("drive.google.com", "docs.google.com", "drive.usercontent.google.com",
+                    "script.google.com", "sites.google.com"):
+        return None
+
+    m = re.search(
+        r'/(?:file|document|spreadsheets|presentation|forms|drawings)/(?:u/\d+/)?d/([A-Za-z0-9_-]+)',
+        parsed.path)
+    if m:
+        return m.group(1)
+
+    m = re.search(r'/folders/([A-Za-z0-9_-]+)', parsed.path)
+    if m:
+        return m.group(1)
+
+    ids = parse_qs(parsed.query).get("id")
+    if ids:
+        return ids[0]
     return None
 
-def get_drive_path(drive_service, file_id):
-    path_components = []
+
+SHARED_PREFIX = "[Partagé avec moi]"
+
+def get_drive_path(drive_service, file_id, cache=None):
+    """Remonte l'arborescence. Pour un fichier partagé dont les dossiers parents ne
+    sont pas visibles, retourne un chemin partiel préfixé par [Partagé avec moi]
+    au lieu de lever une erreur."""
+    if cache is None:
+        cache = {}
+
+    components = []
     current_id = file_id
+    top_meta = None
+    partial = False
+    first = True
 
     while current_id:
-        file_meta = drive_service.files().get(
-            fileId=current_id, 
-            fields='name, parents',
-            supportsAllDrives=True
-        ).execute()
-        
-        path_components.append(file_meta.get('name'))
-        parents = file_meta.get('parents', [])
-        
-        if parents:
-            current_id = parents[0]
-        else:
-            break
+        meta = cache.get(current_id)
+        if meta is None:
+            try:
+                meta = drive_service.files().get(
+                    fileId=current_id,
+                    fields='id, name, parents, driveId',
+                    supportsAllDrives=True
+                ).execute()
+                cache[current_id] = meta
+            except Exception:
+                if first:
+                    raise  # le fichier lui-même est inaccessible
+                partial = True  # parent non visible : on s'arrête là
+                break
+        first = False
+        components.append(meta.get('name'))
+        top_meta = meta
+        parents = meta.get('parents', [])
+        current_id = parents[0] if parents else None
 
-    path_components.reverse()
-    return "/" + "/".join(path_components)
+    components.reverse()
+
+    # Élément le plus haut sans parent : racine "Mon Drive", Drive partagé, ou orphelin partagé
+    orphan_shared = False
+    if top_meta and not partial and not top_meta.get('driveId'):
+        if '__root__' not in cache:
+            try:
+                cache['__root__'] = drive_service.files().get(fileId='root', fields='id').execute()['id']
+            except Exception:
+                cache['__root__'] = None
+        orphan_shared = top_meta.get('id') != cache['__root__']
+
+    if partial or orphan_shared:
+        components.insert(0, SHARED_PREFIX)
+    return "/" + "/".join(components)
+
 
 def compute_lowest_common_ancestor(paths):
     if not paths:
@@ -375,6 +430,7 @@ def main_app():
                 st.error(f"Erreur d'authentification : {e}")
                 return
 
+            drive_cache = {}
             for FILE_ID in file_ids:
                 try:
                     file_metadata = services['drive'].files().get(
@@ -399,7 +455,7 @@ def main_app():
                     
                         if target_file_id:
                             try:
-                                path = get_drive_path(services['drive'], target_file_id)
+                                path = get_drive_path(services['drive'], target_file_id, drive_cache)
                                 accessible_paths.append({'location': location, 'url': url, 'path': path})
                             except Exception as e:
                                 external_or_inaccessible.append({
