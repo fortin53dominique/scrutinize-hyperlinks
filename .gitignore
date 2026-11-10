@@ -1,0 +1,17 @@
+# Secrets et identifiants
+.streamlit/secrets.toml
+token.json
+client_secret*.json
+credentials_service_account.json
+*.pem
+.env
+idcli
+ 
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+ 
+#emacs
+*~
